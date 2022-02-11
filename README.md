@@ -8,13 +8,14 @@ modprobe spi-ft232h usb_wait_msec=(ms delay after USB xfer) param_gpio_base=(gpi
 
 Cross compiling:
 
-ARCH=<architecture> CROSS_COMPILE=<compiler prefix> INSTALL_MOD_PATH=<destination_dir> KDIR=<kernel_source_dir> make
+ARCH=<architecture> CROSS_COMPILE=<compiler_prefix> INSTALL_MOD_PATH=<destination_dir> KDIR=<kernel_source_dir> make
 
-ARCH=<architecture> CROSS_COMPILE=<compiler prefix> INSTALL_MOD_PATH=<destination_dir> KDIR=<kernel_source_dir> make modules_install
+ARCH=<architecture> CROSS_COMPILE=<compiler_prefix> INSTALL_MOD_PATH=<destination_dir> KDIR=<kernel_source_dir> make modules_install
 
 Native compiling:
 
 KDIR=<kernel_source_dir> make
+
 KDIR=<kernel_source_dir> make modules_install
 
 On loading the driver will print the SPI bus number values and the GPIO base number values. These are used as parameters when loading the nrc.ko module.
