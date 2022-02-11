@@ -1,6 +1,7 @@
 /*
  * FTDI FT232H SPI Host Driver
  * GPL-2.0
+ * Copyright James Ewing <james@teledatics.com> - added parts of Newracom FTDI USB driver
  * Copyright Yuji Sasaki <sasaki@silexamerica.com>
  * Based on work by Anatolij Gustschin <agust@denx.de>
  */
