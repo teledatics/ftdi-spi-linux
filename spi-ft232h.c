@@ -38,6 +38,10 @@ static int param_gpio_base = -1;
 module_param_named(gpio_base_num, param_gpio_base, int, 0600);
 MODULE_PARM_DESC(gpio_base_num, "GPIO controller base number (if negative, dynamic allocation)");
 
+static int param_bus_num = -1;
+module_param_named(spi_bus_num, param_bus_num, int, 0600);
+MODULE_PARM_DESC(spi_bus_num, "SPI controller bus number (if negative, dynamic allocation)");
+
 #define SPI_INTF_DEVNAME	"spi-ft232h"
 
 /* SPI controller/master Compatibility Layer */
@@ -551,7 +555,7 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 	priv->intf = to_usb_interface(dev->parent);
 	priv->iops = pd->ops;
 
-	master->bus_num = -1;
+	master->bus_num = (param_bus_num >= 0) ? param_bus_num : -1;
 	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_LOOP |
 			    SPI_CS_HIGH | SPI_LSB_FIRST;
 	master->num_chipselect = 1;
@@ -568,6 +572,8 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 		spi_controller_put(master);
 		return ret;
 	}
+	
+	dev_info(dev, "spi_master: bus_num=%d\n", master->bus_num);
 
 	ret = priv->iops->set_bitmode(priv->intf, 0x00, BITMODE_MPSSE);
 	if (ret < 0) {
