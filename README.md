@@ -1,10 +1,11 @@
-Teledatics FTDI SPI Linux driver
+# Teledatics FTDI SPI Linux driver
 
 This module is for use with the Teledatics TD-XPAH development platform. Load the module before the nrc.ko Wi-Fi driver module.
 
 Parameters (optional):
 
-modprobe spi-ft232h usb_wait_msec=(ms delay after USB xfer) param_gpio_base=(gpio controller base number) latency=(latency in ms)
+modprobe spi-ft232h usb_wait_msec=(ms delay after USB xfer) param_bus_num=(spi bus number) param_gpio_base=(gpio controller base number) latency=(latency in ms)
+
 
 Cross compiling:
 
