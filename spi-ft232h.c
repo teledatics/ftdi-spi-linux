@@ -46,7 +46,7 @@ MODULE_PARM_DESC(spi_bus_num, "SPI controller bus number (if negative, dynamic a
 
 static unsigned int irq_poll_period = 0;
 module_param(irq_poll_period, uint, 0644);
-MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in ms (default 5 ms)");
+MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in ms (default 10 ms)");
 
 #define SPI_INTF_DEVNAME	"spi-ft232h"
 
@@ -91,8 +91,7 @@ struct ft232h_intf_priv {
 	struct irq_chip		mpsse_irq;
 	int			irq_base;
 	bool              	irq_enabled[FTDI_MPSSE_GPIOS];
-	int               	irq_gpio_map[FTDI_MPSSE_GPIOS];
-	int			irq_types[FTDI_MPSSE_GPIOS];
+	int			irq_type[FTDI_MPSSE_GPIOS];
 };
 
 struct ftdi_spi {
@@ -1270,7 +1269,7 @@ static struct platform_device *mpsse_dev_register(struct ft232h_intf_priv *priv,
 	if (ret < 0)
 		goto err;
 
-	dev_info(&pdev->dev, "%s done\n", __func__);
+	dev_dbg(&pdev->dev, "%s done\n", __func__);
 
 	ret = ftdi_spi_probe(pdev);
 	if (ret < 0)
@@ -1582,7 +1581,7 @@ static int mpsse_irq_set_type(struct irq_data *data, unsigned int type)
 	if (irq < 0 || irq >= chip->ngpio) 
 		return -EINVAL;
 
-	priv->irq_types[irq] = type;
+	priv->irq_type[irq] = type;
 
 	return 0;
 }
@@ -1612,7 +1611,12 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 		
 		gpio_val = ftdi_gpio_get(priv->intf, offset);
 		
-		if (gpio_val) {
+		if (!gpio_val && 
+		    (priv->irq_type[offset] == IRQ_TYPE_EDGE_FALLING || 
+		     priv->irq_type[offset] == IRQ_TYPE_LEVEL_LOW)) {
+			handle_nested_irq(priv->irq_base+offset);
+		}
+		else if (gpio_val) {
 			handle_nested_irq(priv->irq_base+offset);
 		}
 	}
@@ -1687,6 +1691,7 @@ static int ftdi_mpsse_irq_probe(struct usb_interface *intf)
 	
 	for (i = 0; i < chip->ngpio; i++) {
 		priv->irq_enabled[i] = false;
+		priv->irq_type[i] = IRQ_TYPE_NONE;
 		irq_set_chip(priv->irq_base + i, &priv->mpsse_irq);
 		irq_set_chip_data(priv->irq_base + i, priv);
 		irq_clear_status_flags(priv->irq_base + i, IRQ_NOREQUEST | IRQ_NOPROBE);
