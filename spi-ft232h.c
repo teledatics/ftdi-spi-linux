@@ -46,7 +46,7 @@ MODULE_PARM_DESC(spi_bus_num, "SPI controller bus number (if negative, dynamic a
 
 static unsigned int irq_poll_period = 0;
 module_param(irq_poll_period, uint, 0644);
-MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in ms (default 10 ms)");
+MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in ms (default 5 ms)");
 
 #define SPI_INTF_DEVNAME	"spi-ft232h"
 
@@ -1622,7 +1622,7 @@ static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 	}
 }
 
-#define FTDI_IRQ_POLL_PERIOD_MS  10
+#define FTDI_IRQ_POLL_PERIOD_MS  5
 static int ftdi_irq_poll_function(void* argument)
 {
 	struct ft232h_intf_priv *priv = (struct ft232h_intf_priv*)argument;
