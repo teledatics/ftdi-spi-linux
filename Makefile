@@ -1,8 +1,8 @@
 KDIR ?= /lib/modules/$(shell uname -r)/build
 BUILD_DIR:=$(shell pwd)
-# KBUILD_OPTIONS += CROSS_COMPILE=arm-linux- ARCH=arm
+KDIR_CONFIG ?= $(KDIR)
 
-include $(KDIR)/.config
+include $(KDIR_CONFIG)/.config
 obj-m += spi-ft232h.o
 
 all: modules
