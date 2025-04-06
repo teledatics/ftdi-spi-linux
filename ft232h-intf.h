@@ -84,6 +84,11 @@ struct bulk_desc {
 	int timeout;
 };
 
+int ftdi_gpio_get(struct usb_interface *intf, unsigned int offset);
+void ftdi_gpio_set(struct usb_interface *intf, unsigned int offset, int value);
+int ftdi_gpio_direction_input(struct usb_interface *intf, unsigned int offset);
+int ftdi_gpio_direction_output(struct usb_interface *intf, unsigned int offset, int value);
+
 /*
  * struct ft232h_intf_ops - FT232H interface operations for upper drivers
  *

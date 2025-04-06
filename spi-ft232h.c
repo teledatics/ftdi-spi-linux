@@ -151,8 +151,8 @@ static inline void spi_controller_put(struct spi_controller *ctlr)
 
 static void ftdi_spi_set_cs(struct spi_device *spi, bool enable)
 {
-	struct ftdi_spi *priv = spi_controller_get_devdata(spi->master);
-        priv->iops->gpio_set(priv->intf, spi->chip_select, enable);
+	struct ftdi_spi *priv = spi_controller_get_devdata(spi->controller);
+        priv->iops->gpio_set(priv->intf, *spi->chip_select, enable);
 }
 
 static inline u8 ftdi_spi_txrx_byte_cmd(struct spi_device *spi)
