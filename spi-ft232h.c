@@ -28,6 +28,8 @@
 
 #include "ft232h-intf.h"
 
+#undef FTDI_IRQ_SPI_POLL
+
 static int param_latency = 1;
 module_param_named(latency, param_latency, int, 0600);
 MODULE_PARM_DESC(latency, "latency timer value (1ms ~ 255ms, default 1ms)");
@@ -44,9 +46,11 @@ static int param_bus_num = -1;
 module_param_named(spi_bus_num, param_bus_num, int, 0600);
 MODULE_PARM_DESC(spi_bus_num, "SPI controller bus number (if negative, dynamic allocation)");
 
+#ifdef FTDI_IRQ_SPI_POLL
 static unsigned int irq_poll_period = 0;
 module_param(irq_poll_period, uint, 0644);
 MODULE_PARM_DESC(irq_poll_period, "GPIO polling period in ms (default 5 ms)");
+#endif
 
 #define SPI_INTF_DEVNAME	"spi-ft232h"
 
@@ -202,6 +206,7 @@ static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
 			  struct spi_transfer *t)
 {
 	const struct ft232h_intf_ops *ops = priv->iops;
+	struct ft232h_intf_priv *priv_intf = usb_get_intfdata(priv->intf);
 	struct device *dev = &priv->pdev->dev;
 	void *rx_offs;
 	const void *tx_offs;
@@ -248,8 +253,9 @@ static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
 		tout = 10;
 		rx_remaining = stride;
 		do {
-			rx_stride = min_t(size_t, rx_remaining, SZ_512);
-			ret = ops->read_data(priv->intf, priv->xfer_buf, rx_stride);
+			rx_stride = min_t(size_t, rx_remaining, priv_intf->bulk_in_sz);
+			ret = ops->read_data(priv->intf, rx_offs, rx_stride);
+			
 			if (ret < 0)
 				goto fail;
 			if (!ret) {
@@ -262,7 +268,6 @@ static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
 			}
 			print_hex_dump_debug("RD: ", DUMP_PREFIX_OFFSET, 16, 1,
 				     priv->xfer_buf, ret, 1);
-			memcpy(rx_offs, priv->xfer_buf, ret);
 			rx_offs += ret;
 			rx_remaining -= ret;
 		} while (rx_remaining);
@@ -869,12 +874,27 @@ static int ftdi_read_data(struct usb_interface *intf, void *buf, size_t len)
 	if (desc.act_len <= 2)
 		return 0;
 
-	/* Skip first two status bytes */
-	ret = desc.act_len - 2;
-	if (ret > len)
-		ret = len;
-	memcpy(buf, desc.data + 2, ret);
-	return ret;
+	/* Remove 2-byte status from each 512-byte packet */
+	size_t maxp = usb_maxpacket(priv->udev, usb_rcvbulkpipe(priv->udev, priv->bulk_in));
+	if (!maxp) maxp = 512;
+	size_t offset = 0;
+	size_t out_len = 0;
+	while (offset < desc.act_len) {
+		size_t pkt_len = min(maxp, desc.act_len - offset);
+		if (pkt_len <= 2) {
+			offset += pkt_len;   // packet contains only status
+			break;
+		}
+		/* Copy packet payload (skip status bytes) */
+		size_t data_len = pkt_len - 2;
+		if (out_len + data_len > len)
+			data_len = len - out_len;
+		memcpy(buf + out_len, desc.data + offset + 2, data_len);
+		out_len += data_len;
+		offset += pkt_len;
+	}
+	
+	return out_len;
 }
 
 /*
@@ -918,6 +938,7 @@ static int ftdi_write_data(struct usb_interface *intf,
 static int ftdi_set_bitmode(struct usb_interface *intf, unsigned char bitmask,
 			    unsigned char mode)
 {
+	struct ft232h_intf_priv *priv = usb_get_intfdata(intf);
 	struct ctrl_desc desc;
 	int ret;
 
@@ -925,7 +946,7 @@ static int ftdi_set_bitmode(struct usb_interface *intf, unsigned char bitmask,
 	desc.data = NULL;
 	desc.request = FTDI_SIO_SET_BITMODE_REQUEST;
 	desc.requesttype = USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT;
-	desc.index = 1;
+	desc.index = priv->index;
 	desc.value = (mode << 8) | bitmask;
 	desc.size = 0;
 	desc.timeout = USB_CTRL_SET_TIMEOUT;
@@ -1346,7 +1367,8 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 	}
 
 	priv->usb_dev_id = id;
-	priv->index = 1;
+	/* Identify the FTDI channel from the alternate-setting (0=A,1=B,2=C,3=D) */
+	priv->index = intf->cur_altsetting->desc.bAlternateSetting + 1;
 	priv->intf = intf;
 	priv->info = (struct ft232h_intf_info *)id->driver_info;
 
@@ -1598,6 +1620,7 @@ static int ftdi_mpsse_gpio_to_irq(struct gpio_chip *chip,
 	return priv->irq_base + offset;
 }
 
+#ifdef FTDI_IRQ_SPI_POLL
 static void ftdi_mpsse_gpio_check(struct ft232h_intf_priv *priv)
 {
 	struct gpio_chip *chip = &priv->mpsse_gpio;
@@ -1670,6 +1693,7 @@ static int ftdi_irq_poll_function(void* argument)
 	
 	return 0;
 }
+#endif /* FTDI_IRQ_SPI_POLL */
 
 static int ftdi_mpsse_irq_probe(struct usb_interface *intf)
 {
@@ -1785,8 +1809,12 @@ static int ftdi_mpsse_gpio_probe(struct usb_interface *intf)
 	priv->lookup_gpios = lookup;
 	gpiod_add_lookup_table(priv->lookup_gpios);
 
+#ifdef FTDI_IRQ_SPI_POLL	
 	init_completion(&priv->gpio_thread_complete);
 	priv->gpio_thread = kthread_run(&ftdi_irq_poll_function, priv, "ftdi-irq-poll");
+#else
+	priv->gpio_thread = NULL;
+#endif
 	
 	return 0;
 }
