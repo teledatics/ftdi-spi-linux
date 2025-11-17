@@ -1,7 +1,7 @@
 /*
  * FTDI FT232H SPI Host Driver
  * GPL-2.0
- * Copyright James Ewing <james@teledatics.com> - added parts of Newracom FTDI USB driver
+ * Copyright James Ewing <james@teledatics.com>
  * Copyright Yuji Sasaki <sasaki@silexamerica.com>
  * Based on work by Anatolij Gustschin <agust@denx.de>
  */
@@ -25,6 +25,18 @@
 #include <linux/usb.h>
 #include <linux/of.h>
 #include <linux/irq.h>
+#include <linux/kthread.h>
+#include <linux/spinlock.h>
+#include <linux/completion.h>
+#include <linux/ktime.h>
+#include <linux/math64.h>
+#include <linux/string.h>
+#include <linux/scatterlist.h>
+#include <linux/err.h>
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#endif
 
 #include "ft232h-intf.h"
 
@@ -45,6 +57,92 @@ MODULE_PARM_DESC(gpio_base_num, "GPIO controller base number (if negative, dynam
 static int param_bus_num = -1;
 module_param_named(spi_bus_num, param_bus_num, int, 0600);
 MODULE_PARM_DESC(spi_bus_num, "SPI controller bus number (if negative, dynamic allocation)");
+
+/*
+ * Performance tuning knobs – defaults keep legacy behaviour but allow
+ * opt-in batching/latency trade-offs when explicitly configured.
+ */
+enum ftdi_perf_profile {
+	PERF_PROFILE_LEGACY = 0,
+	PERF_PROFILE_BALANCED = 1,
+	PERF_PROFILE_AGGRESSIVE = 2,
+};
+
+static int param_perf_profile = PERF_PROFILE_AGGRESSIVE;
+module_param_named(perf_profile, param_perf_profile, int, 0600);
+MODULE_PARM_DESC(perf_profile, "Performance profile: 0=legacy, 1=balanced, 2=aggressive");
+
+static unsigned int param_max_block;
+module_param_named(max_block, param_max_block, uint, 0600);
+MODULE_PARM_DESC(max_block, "Maximum SPI payload bytes per FTDI burst (0=auto)");
+
+static unsigned int param_bulk_in_buf_kb;
+module_param_named(bulk_in_buf_kb, param_bulk_in_buf_kb, uint, 0600);
+MODULE_PARM_DESC(bulk_in_buf_kb, "Bulk-in buffer size in KiB (0=endpoint max)");
+
+static bool param_flush_per_block = false;
+static bool param_flush_overridden;
+
+static int ftdi_param_set_flush(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	if (!ret)
+		param_flush_overridden = true;
+	return ret;
+}
+
+static int ftdi_param_get_flush(char *buffer, const struct kernel_param *kp)
+{
+	return param_get_bool(buffer, kp);
+}
+
+static const struct kernel_param_ops ftdi_flush_param_ops = {
+	.set = ftdi_param_set_flush,
+	.get = ftdi_param_get_flush,
+};
+
+module_param_cb(flush_per_block, &ftdi_flush_param_ops,
+		      &param_flush_per_block, 0600);
+MODULE_PARM_DESC(flush_per_block,
+		      "Force SEND_IMMEDIATE after every SPI payload block");
+
+static unsigned int param_rx_retry_us;
+module_param_named(rx_retry_us, param_rx_retry_us, uint, 0600);
+MODULE_PARM_DESC(rx_retry_us, "Delay in usec between bulk-in polls when no data is returned");
+
+static bool param_enable_stats = true;
+module_param_named(enable_stats, param_enable_stats, bool, 0600);
+MODULE_PARM_DESC(enable_stats, "Enable debugfs performance statistics (default disabled)");
+
+static unsigned int param_pipeline_depth;
+static bool param_pipeline_overridden;
+
+static int ftdi_param_set_pipeline_depth(const char *val,
+					     const struct kernel_param *kp)
+{
+	int ret = param_set_uint(val, kp);
+
+	if (!ret)
+		param_pipeline_overridden = true;
+	return ret;
+}
+
+static int ftdi_param_get_pipeline_depth(char *buffer,
+					     const struct kernel_param *kp)
+{
+	return param_get_uint(buffer, kp);
+}
+
+static const struct kernel_param_ops ftdi_pipeline_param_ops = {
+	.set = ftdi_param_set_pipeline_depth,
+	.get = ftdi_param_get_pipeline_depth,
+};
+
+module_param_cb(pipeline_depth, &ftdi_pipeline_param_ops,
+		      &param_pipeline_depth, 0600);
+MODULE_PARM_DESC(pipeline_depth,
+		      "Number of in-flight read URBs (0=auto per perf profile)");
 
 #ifdef FTDI_IRQ_SPI_POLL
 static unsigned int irq_poll_period = 0;
@@ -76,6 +174,7 @@ struct ft232h_intf_priv {
 	u8			bulk_in;
 	u8			bulk_out;
 	size_t			bulk_in_sz;
+	size_t			bulk_in_pkt_sz;
 	void			*bulk_in_buf;
 
 	const struct usb_device_id	*usb_dev_id;
@@ -98,6 +197,56 @@ struct ft232h_intf_priv {
 	int			irq_type[FTDI_MPSSE_GPIOS];
 };
 
+/* Cumulative transfer counters exported through debugfs for benchmarking. */
+struct ftdi_spi_stats {
+	u64 tx_bytes;
+	u64 rx_bytes;
+	u64 total_transfers;
+	u64 xfers_full_duplex;
+	u64 xfers_tx_only;
+	u64 xfers_rx_only;
+	u64 read_timeouts;
+	u64 read_empty_loops;
+	u64 transfer_errors;
+	u64 total_latency_ns;
+	u64 max_latency_ns;
+	u64 tx_copyfree_bytes;
+	u64 tx_copyfree_chunks;
+	u64 tx_copyfree_fallbacks;
+	u64 pipeline_max_inflight;
+	u64 pipeline_wait_events;
+	u64 tx_chunks_total;
+	u64 tx_partial_chunks;
+	u64 tx_timeout_errors;
+	u64 bytes_since_tune;
+	u64 latency_min_ns;
+	u64 latency_max_ns;
+};
+
+#define FTDI_PIPELINE_MAX	4
+
+struct ftdi_urb_ctx {
+	struct urb *urb;
+	u8 *buf;
+	struct completion done;
+	u8 *dst;
+	size_t expected;
+	size_t actual;
+	int status;
+};
+
+struct ftdi_pipeline {
+	struct ftdi_urb_ctx *ctxs;
+	unsigned int depth;
+	unsigned int head;
+	unsigned int tail;
+	unsigned int in_flight;
+};
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+static struct dentry *ftdi_debugfs_root;
+#endif
+
 struct ftdi_spi {
 	struct platform_device *pdev;
 	struct usb_interface *intf;
@@ -109,9 +258,34 @@ struct ftdi_spi {
 	u8 xfer_buf[SZ_64K];
 	u16 last_mode;
 	u32 last_speed_hz;
+	size_t max_burst_bytes;
+	bool flush_per_block;
+	u32 rx_retry_delay_us;
+	unsigned int rx_max_loops;
+	bool stats_enabled;
+	spinlock_t stats_lock;
+	struct ftdi_spi_stats stats;
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	struct dentry *debugfs_root;
+#endif
+	struct ftdi_pipeline pipeline;
+	unsigned long tuning_jiffies;
+	unsigned int tuning_rounds;
+	bool flush_forced;
+	unsigned int pipeline_forced;
+	bool copyfree_disabled;
 };
 
 static DEFINE_IDA(ftdi_devid_ida);
+
+static int ftdi_spi_pipeline_setup(struct ftdi_spi *priv, unsigned int depth);
+static void ftdi_spi_pipeline_teardown(struct ftdi_spi *priv);
+static void ftdi_spi_stats_copy_free(struct ftdi_spi *priv, size_t bytes,
+				     bool success);
+static void ftdi_spi_stats_pipeline_submit(struct ftdi_spi *priv,
+					     unsigned int in_flight);
+static void ftdi_spi_stats_pipeline_wait(struct ftdi_spi *priv);
+static int ftdi_spi_push_buf(struct ftdi_spi *priv, const void *buf, size_t len);
 
 enum gpiol {
 	MPSSE_SK	= BIT(0),
@@ -153,10 +327,41 @@ static inline void spi_controller_put(struct spi_controller *ctlr)
 #define spi_unregister_controller(_ctlr) spi_unregister_master(_ctlr)
 #endif
 
+/* Handle scalar chip_select (<= v6.7) and array+mask (v6.8+). */
+#if defined(SPI_DEVICE_CS_CNT_MAX)
+static inline unsigned int ftdi_spi_chip_select(struct spi_device *spi)
+{
+	u8 idx = spi->cs_index_mask ? ffs(spi->cs_index_mask) - 1 : 0;
+	u8 num = spi->num_chipselect ? spi->num_chipselect : 1;
+
+	if (idx >= num)
+		idx = 0;
+
+	return spi_get_chipselect(spi, idx);
+}
+#elif defined(SPI_CS_CNT_MAX)
+static inline unsigned int ftdi_spi_chip_select(struct spi_device *spi)
+{
+	u8 idx = spi->cs_index_mask ? ffs(spi->cs_index_mask) - 1 : 0;
+
+	if (idx >= SPI_CS_CNT_MAX)
+		idx = 0;
+
+	return spi_get_chipselect(spi, idx);
+}
+#else
+static inline unsigned int ftdi_spi_chip_select(struct spi_device *spi)
+{
+	return spi->chip_select;
+}
+#endif
+
 static void ftdi_spi_set_cs(struct spi_device *spi, bool enable)
 {
 	struct ftdi_spi *priv = spi_controller_get_devdata(spi->controller);
-        priv->iops->gpio_set(priv->intf, *spi->chip_select, enable);
+	unsigned int cs = ftdi_spi_chip_select(spi);
+
+	priv->iops->gpio_set(priv->intf, cs, enable);
 }
 
 static inline u8 ftdi_spi_txrx_byte_cmd(struct spi_device *spi)
@@ -202,7 +407,672 @@ static inline int ftdi_spi_loopback_cfg(struct ftdi_spi *priv, int on)
 	return ret;
 }
 
-static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
+static void ftdi_spi_stats_account_rx(struct ftdi_spi *priv,
+				     unsigned int empty_loops,
+				     unsigned int timeouts)
+{
+	unsigned long flags;
+
+	if (!priv->stats_enabled || (!empty_loops && !timeouts))
+		return;
+
+	/* Accumulate the amount of polling the fast path required. */
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	priv->stats.read_empty_loops += empty_loops;
+	priv->stats.read_timeouts += timeouts;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+}
+
+static void ftdi_spi_stats_complete(struct ftdi_spi *priv,
+				       struct spi_transfer *xfer,
+				       int status,
+				       u64 duration_ns)
+{
+	unsigned long flags;
+	u64 tx_bytes = xfer->tx_buf ? xfer->len : 0;
+	u64 rx_bytes = xfer->rx_buf ? xfer->len : 0;
+
+	if (!priv->stats_enabled)
+		return;
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	priv->stats.total_transfers++;
+	if (xfer->tx_buf && xfer->rx_buf)
+		priv->stats.xfers_full_duplex++;
+	else if (xfer->tx_buf)
+		priv->stats.xfers_tx_only++;
+	else if (xfer->rx_buf)
+		priv->stats.xfers_rx_only++;
+
+	priv->stats.tx_bytes += tx_bytes;
+	priv->stats.rx_bytes += rx_bytes;
+	priv->stats.bytes_since_tune += tx_bytes + rx_bytes;
+	priv->stats.total_latency_ns += duration_ns;
+	if (duration_ns > priv->stats.max_latency_ns)
+		priv->stats.max_latency_ns = duration_ns;
+	if (!priv->stats.latency_min_ns || duration_ns < priv->stats.latency_min_ns)
+		priv->stats.latency_min_ns = duration_ns;
+	if (duration_ns > priv->stats.latency_max_ns)
+		priv->stats.latency_max_ns = duration_ns;
+	if (status < 0)
+		priv->stats.transfer_errors++;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+}
+
+#define FTDI_READ_TIMEOUT_JIFFIES	msecs_to_jiffies(FTDI_USB_READ_TIMEOUT)
+
+static void ftdi_spi_stats_copy_free(struct ftdi_spi *priv, size_t bytes,
+				     bool success)
+{
+	unsigned long flags;
+
+	if (!priv->stats_enabled)
+		return;
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	if (success) {
+		priv->stats.tx_copyfree_bytes += bytes;
+		priv->stats.tx_copyfree_chunks++;
+	} else {
+		priv->stats.tx_copyfree_fallbacks++;
+	}
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+}
+static void ftdi_spi_stats_tx_chunk(struct ftdi_spi *priv, size_t bytes,
+				   bool partial, bool timeout)
+{
+	unsigned long flags;
+
+	if (!priv->stats_enabled)
+		return;
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	priv->stats.tx_chunks_total++;
+	if (partial)
+		priv->stats.tx_partial_chunks++;
+	if (timeout)
+		priv->stats.tx_timeout_errors++;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+}
+
+static void ftdi_spi_stats_pipeline_submit(struct ftdi_spi *priv,
+                                           unsigned int in_flight)
+{
+	unsigned long flags;
+
+	if (!priv->stats_enabled)
+		return;
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	if (in_flight > priv->stats.pipeline_max_inflight)
+		priv->stats.pipeline_max_inflight = in_flight;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+}
+
+static void ftdi_spi_stats_pipeline_wait(struct ftdi_spi *priv)
+{
+	unsigned long flags;
+
+	if (!priv->stats_enabled)
+		return;
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	priv->stats.pipeline_wait_events++;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+}
+
+#define FTDI_TUNE_INTERVAL_JIFFIES	msecs_to_jiffies(5000)
+
+static void ftdi_spi_maybe_retune(struct ftdi_spi *priv)
+{
+	unsigned long now = jiffies;
+	struct ftdi_spi_stats snapshot;
+	unsigned long flags;
+	bool need_retune = false;
+	bool reset_stats = false;
+	bool increase_burst = false;
+	u32 copyfree_fallback_ratio = 0;
+	u32 pipeline_util_pct = 0;
+	bool consider_copyfree = false;
+	bool consider_pipeline = false;
+
+	if (!priv->stats_enabled)
+		return;
+
+	if (time_before(now, priv->tuning_jiffies + FTDI_TUNE_INTERVAL_JIFFIES))
+		return;
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	snapshot = priv->stats;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+
+	priv->tuning_jiffies = now;
+	priv->tuning_rounds++;
+
+	/*
+	 * If copy-free TX keeps falling back, disable it by forcing flushes
+	 * to avoid repeated SG retries.
+	 */
+	if (snapshot.tx_copyfree_chunks)
+		copyfree_fallback_ratio =
+			DIV_ROUND_UP(snapshot.tx_copyfree_fallbacks * 100,
+				     snapshot.tx_copyfree_chunks);
+	if (snapshot.tx_copyfree_chunks >= 32)
+		consider_copyfree = true;
+
+	if (consider_copyfree && !priv->copyfree_disabled &&
+	    copyfree_fallback_ratio > 12) {
+		priv->copyfree_disabled = true;
+		priv->flush_per_block = true;
+		priv->flush_forced = true;
+		need_retune = true;
+		reset_stats = true;
+	}
+
+	/* If the pipeline never uses more than one URB, shrink depth. */
+	if (snapshot.pipeline_wait_events) {
+		u64 util = DIV_ROUND_UP(snapshot.pipeline_max_inflight * 100ULL,
+				       max_t(unsigned int, priv->pipeline.depth, 1U));
+
+		pipeline_util_pct = min_t(u32, 100U, (u32)util);
+	}
+	if (snapshot.pipeline_wait_events > 8)
+		consider_pipeline = true;
+
+	if (!priv->pipeline_forced && priv->pipeline.depth > 1 &&
+	    consider_pipeline && pipeline_util_pct <= 25) {
+		priv->pipeline.depth = 1;
+		priv->pipeline_forced = 1;
+		need_retune = true;
+		reset_stats = true;
+	}
+
+	/* Grow burst size when transfers are healthy. */
+	if (snapshot.tx_chunks_total >= 64 && snapshot.tx_timeout_errors == 0 &&
+	    snapshot.tx_partial_chunks == 0 && priv->max_burst_bytes >= SZ_8K &&
+	    priv->max_burst_bytes < SZ_64K) {
+		size_t new_burst = priv->max_burst_bytes + SZ_4K;
+		if (new_burst > SZ_64K)
+			new_burst = SZ_64K;
+		priv->max_burst_bytes = new_burst;
+		need_retune = true;
+		reset_stats = true;
+		increase_burst = true;
+	}
+
+	if (snapshot.tx_timeout_errors > 4 || snapshot.tx_partial_chunks > 16) {
+		size_t new_burst = max(priv->max_burst_bytes / 2, (size_t)SZ_4K);
+		priv->max_burst_bytes = new_burst;
+		need_retune = true;
+		reset_stats = true;
+	}
+
+	/* Try re-enabling features after sustained stability. */
+	if (priv->copyfree_disabled && snapshot.tx_copyfree_fallbacks == 0 &&
+	    snapshot.tx_copyfree_chunks >= 128) {
+		priv->copyfree_disabled = false;
+		priv->flush_forced = false;
+		priv->flush_per_block = false;
+		need_retune = true;
+		reset_stats = true;
+	}
+
+	if (priv->pipeline_forced && priv->pipeline.depth < FTDI_PIPELINE_MAX &&
+	    snapshot.pipeline_wait_events == 0 &&
+	    snapshot.pipeline_max_inflight >= priv->pipeline.depth) {
+		priv->pipeline.depth =
+			min_t(unsigned int, priv->pipeline.depth + 1,
+			      FTDI_PIPELINE_MAX);
+		priv->pipeline_forced = priv->pipeline.depth;
+		need_retune = true;
+		reset_stats = true;
+	}
+
+	if (need_retune)
+		dev_info(&priv->pdev->dev,
+			 "adaptive tuning applied: flush=%d depth=%u burst=%zu%s\n",
+			 priv->flush_per_block, priv->pipeline.depth,
+			 priv->max_burst_bytes,
+			 increase_burst ? " (increased)" : "");
+
+	if (reset_stats) {
+		spin_lock_irqsave(&priv->stats_lock, flags);
+		priv->stats.tx_copyfree_fallbacks = 0;
+		priv->stats.tx_copyfree_chunks = 0;
+		priv->stats.tx_copyfree_bytes = 0;
+		priv->stats.pipeline_max_inflight = 0;
+		priv->stats.pipeline_wait_events = 0;
+		priv->stats.tx_chunks_total = 0;
+		priv->stats.tx_partial_chunks = 0;
+		priv->stats.tx_timeout_errors = 0;
+		priv->stats.bytes_since_tune = 0;
+		priv->stats.latency_min_ns = 0;
+		priv->stats.latency_max_ns = 0;
+		spin_unlock_irqrestore(&priv->stats_lock, flags);
+	}
+}
+
+static void ftdi_pipeline_read_complete(struct urb *urb)
+{
+	struct ftdi_urb_ctx *ctx = urb->context;
+
+	ctx->status = urb->status;
+	ctx->actual = urb->actual_length;
+	complete(&ctx->done);
+}
+
+static size_t ftdi_extract_payload(struct ft232h_intf_priv *priv,
+				       u8 *dst, const u8 *src,
+				       size_t act_len, size_t max_copy)
+{
+	size_t maxp = priv->bulk_in_pkt_sz;
+	size_t offset = 0, out_len = 0;
+
+	if (!maxp) {
+		maxp = usb_maxpacket(priv->udev,
+				     usb_rcvbulkpipe(priv->udev, priv->bulk_in));
+		if (!maxp)
+			maxp = SZ_512;
+	}
+
+	while (offset < act_len && out_len < max_copy) {
+		size_t pkt_len = min(maxp, act_len - offset);
+		size_t data_len;
+
+		if (pkt_len <= 2) {
+			offset += pkt_len;
+			continue;
+		}
+
+		data_len = min(max_copy - out_len, pkt_len - 2);
+		memcpy(dst + out_len, src + offset + 2, data_len);
+		out_len += data_len;
+		offset += pkt_len;
+	}
+
+	return out_len;
+}
+
+static void ftdi_pipeline_reset(struct ftdi_pipeline *pipe)
+{
+	pipe->head = 0;
+	pipe->tail = 0;
+	pipe->in_flight = 0;
+}
+
+static void ftdi_pipeline_kill(struct ftdi_pipeline *pipe)
+{
+	unsigned int i;
+
+	if (!pipe->ctxs)
+		return;
+
+	for (i = 0; i < pipe->depth; i++)
+		if (pipe->ctxs[i].urb)
+			usb_kill_urb(pipe->ctxs[i].urb);
+}
+
+static int ftdi_spi_pipeline_setup(struct ftdi_spi *priv, unsigned int depth)
+{
+	struct ftdi_pipeline *pipe = &priv->pipeline;
+	struct ft232h_intf_priv *priv_intf = usb_get_intfdata(priv->intf);
+	struct device *dev = &priv->pdev->dev;
+	unsigned int i;
+	int ret = 0;
+
+	memset(pipe, 0, sizeof(*pipe));
+	depth = clamp_t(unsigned int, depth, 1, FTDI_PIPELINE_MAX);
+	pipe->depth = depth;
+	if (depth <= 1)
+		return 0;
+
+	pipe->ctxs = devm_kcalloc(dev, depth, sizeof(*pipe->ctxs), GFP_KERNEL);
+	if (!pipe->ctxs)
+		return -ENOMEM;
+
+	for (i = 0; i < depth; i++) {
+		struct ftdi_urb_ctx *ctx = &pipe->ctxs[i];
+
+		ctx->urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (!ctx->urb) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		ctx->buf = kmalloc(priv_intf->bulk_in_sz, GFP_KERNEL);
+		if (!ctx->buf) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		init_completion(&ctx->done);
+		ctx->urb->context = ctx;
+	}
+
+	if (ret) {
+		for (; i > 0; i--) {
+			struct ftdi_urb_ctx *ctx = &pipe->ctxs[i - 1];
+
+			kfree(ctx->buf);
+			ctx->buf = NULL;
+			usb_free_urb(ctx->urb);
+			ctx->urb = NULL;
+		}
+		pipe->ctxs = NULL;
+		pipe->depth = 1;
+	}
+
+	ftdi_pipeline_reset(pipe);
+	return ret;
+}
+
+static void ftdi_spi_pipeline_teardown(struct ftdi_spi *priv)
+{
+	struct ftdi_pipeline *pipe = &priv->pipeline;
+	unsigned int i;
+
+	ftdi_pipeline_kill(pipe);
+
+	if (!pipe->ctxs)
+		return;
+
+	for (i = 0; i < pipe->depth; i++) {
+		struct ftdi_urb_ctx *ctx = &pipe->ctxs[i];
+
+		kfree(ctx->buf);
+		ctx->buf = NULL;
+		if (ctx->urb) {
+			usb_free_urb(ctx->urb);
+			ctx->urb = NULL;
+		}
+	}
+
+	pipe->ctxs = NULL;
+	pipe->depth = 1;
+	pipe->head = pipe->tail = pipe->in_flight = 0;
+}
+
+static int ftdi_pipeline_wait_one(struct ftdi_spi *priv,
+				    struct ft232h_intf_priv *priv_intf)
+{
+	struct ftdi_pipeline *pipe = &priv->pipeline;
+	struct device *dev = &priv->pdev->dev;
+	struct ftdi_urb_ctx *ctx;
+	long timeleft;
+	int ret = 0;
+
+	if (!pipe->in_flight)
+		return 0;
+
+	ctx = &pipe->ctxs[pipe->tail];
+	timeleft = wait_for_completion_timeout(&ctx->done,
+						   FTDI_READ_TIMEOUT_JIFFIES);
+	if (!timeleft) {
+		usb_kill_urb(ctx->urb);
+		wait_for_completion(&ctx->done);
+		ctx->status = -ETIMEDOUT;
+	}
+
+	pipe->tail = (pipe->tail + 1) % pipe->depth;
+	pipe->in_flight--;
+	ftdi_spi_stats_pipeline_wait(priv);
+
+	if (ctx->status) {
+		ret = ctx->status;
+		goto out;
+	}
+
+	if (ftdi_extract_payload(priv_intf, ctx->dst, ctx->buf,
+				    ctx->actual, ctx->expected) < ctx->expected) {
+		dev_err(dev, "short read: expected %zu, got %zu\n",
+			ctx->expected, ctx->actual);
+		ret = -EIO;
+	}
+
+out:
+	reinit_completion(&ctx->done);
+	return ret;
+}
+
+static int ftdi_pipeline_wait_all(struct ftdi_spi *priv,
+				     struct ft232h_intf_priv *priv_intf)
+{
+	int ret = 0;
+
+	while (!ret && priv->pipeline.in_flight)
+		ret = ftdi_pipeline_wait_one(priv, priv_intf);
+
+	return ret;
+}
+
+static void ftdi_pipeline_abort(struct ftdi_spi *priv,
+			      struct ft232h_intf_priv *priv_intf)
+{
+	ftdi_pipeline_kill(&priv->pipeline);
+	ftdi_pipeline_wait_all(priv, priv_intf);
+	ftdi_pipeline_reset(&priv->pipeline);
+}
+
+static int ftdi_pipeline_submit_read(struct ftdi_spi *priv,
+				 struct ft232h_intf_priv *priv_intf,
+				 u8 *dst, size_t expected)
+{
+	struct ftdi_pipeline *pipe = &priv->pipeline;
+	struct ftdi_urb_ctx *ctx = &pipe->ctxs[pipe->head];
+	struct usb_device *udev = priv_intf->udev;
+	int ret;
+
+	reinit_completion(&ctx->done);
+	ctx->dst = dst;
+	ctx->expected = expected;
+	ctx->actual = 0;
+	ctx->status = 0;
+
+	usb_fill_bulk_urb(ctx->urb, udev,
+			usb_rcvbulkpipe(udev, priv_intf->bulk_in),
+			ctx->buf, priv_intf->bulk_in_sz,
+			ftdi_pipeline_read_complete, ctx);
+	ctx->urb->transfer_flags = 0;
+
+	ret = usb_submit_urb(ctx->urb, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	pipe->head = (pipe->head + 1) % pipe->depth;
+	pipe->in_flight++;
+	ftdi_spi_stats_pipeline_submit(priv, pipe->in_flight);
+	return 0;
+}
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+
+static int ftdi_stats_show(struct seq_file *s, void *unused)
+{
+	struct ftdi_spi *priv = s->private;
+	struct ftdi_spi_stats snapshot;
+	unsigned long flags;
+	u64 avg = 0;
+
+	if (!priv->stats_enabled) {
+		seq_puts(s, "{}\n");
+		return 0;
+	}
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	snapshot = priv->stats;
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+
+	if (snapshot.total_transfers)
+		avg = div64_u64(snapshot.total_latency_ns,
+				 snapshot.total_transfers);
+
+	seq_printf(s,
+		   "{ \"tx_bytes\": %llu, \"rx_bytes\": %llu, \"transfers\": %llu, "
+		   "\"full_duplex\": %llu, \"tx_only\": %llu, \"rx_only\": %llu, "
+		   "\"read_timeouts\": %llu, \"read_empty_loops\": %llu, "
+		   "\"transfer_errors\": %llu, \"max_latency_ns\": %llu, "
+		   "\"avg_latency_ns\": %llu, \"min_latency_ns\": %llu, "
+		   "\"tx_copyfree_bytes\": %llu, "
+		   "\"tx_copyfree_chunks\": %llu, \"tx_copyfree_fallbacks\": %llu, "
+		   "\"pipeline_max_inflight\": %llu, \"pipeline_wait_events\": %llu, "
+		   "\"tx_chunks_total\": %llu, \"tx_partial_chunks\": %llu, "
+		   "\"tx_timeout_errors\": %llu, \"bytes_since_tune\": %llu }\n",
+		   snapshot.tx_bytes, snapshot.rx_bytes, snapshot.total_transfers,
+		   snapshot.xfers_full_duplex, snapshot.xfers_tx_only,
+		   snapshot.xfers_rx_only, snapshot.read_timeouts,
+		   snapshot.read_empty_loops, snapshot.transfer_errors,
+		   snapshot.max_latency_ns, avg,
+		   snapshot.latency_min_ns ? snapshot.latency_min_ns : 0,
+		   snapshot.tx_copyfree_bytes, snapshot.tx_copyfree_chunks,
+		   snapshot.tx_copyfree_fallbacks, snapshot.pipeline_max_inflight,
+		   snapshot.pipeline_wait_events, snapshot.tx_chunks_total,
+		   snapshot.tx_partial_chunks, snapshot.tx_timeout_errors,
+		   snapshot.bytes_since_tune);
+
+	return 0;
+}
+
+static int ftdi_stats_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, ftdi_stats_show, inode->i_private);
+}
+
+static const struct file_operations ftdi_stats_fops = {
+	.owner		= THIS_MODULE,
+	.open		= ftdi_stats_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+};
+
+static int ftdi_stats_reset_open(struct inode *inode, struct file *file)
+{
+	file->private_data = inode->i_private;
+	return 0;
+}
+
+static ssize_t ftdi_stats_reset_write(struct file *file,
+					 const char __user *buf,
+					 size_t len, loff_t *ppos)
+{
+	struct ftdi_spi *priv = file->private_data;
+	unsigned long flags;
+
+	if (!priv->stats_enabled)
+		return len;
+
+	spin_lock_irqsave(&priv->stats_lock, flags);
+	memset(&priv->stats, 0, sizeof(priv->stats));
+	spin_unlock_irqrestore(&priv->stats_lock, flags);
+
+	return len;
+}
+
+static const struct file_operations ftdi_stats_reset_fops = {
+	.owner	= THIS_MODULE,
+	.open	= ftdi_stats_reset_open,
+	.write	= ftdi_stats_reset_write,
+	.llseek	= no_llseek,
+};
+
+#endif /* CONFIG_DEBUG_FS */
+
+static int ftdi_spi_txrx_send_chunk(struct ftdi_spi *priv,
+				       struct ft232h_intf_priv *priv_intf,
+				       const u8 *tx_src, size_t stride,
+				       bool last, bool allow_copyfree,
+				       bool *copyfree_used,
+				       bool *copyfree_fallback,
+				       bool *chunk_timeout)
+{
+	struct usb_device *udev = priv_intf->udev;
+	bool used = false;
+	bool fallback = false;
+	int ret;
+	size_t send_len;
+
+	if (copyfree_used)
+		*copyfree_used = false;
+	if (copyfree_fallback)
+		*copyfree_fallback = false;
+	if (chunk_timeout)
+		*chunk_timeout = false;
+
+	if (allow_copyfree && stride >= SZ_1K) {
+		struct scatterlist sg[3];
+		struct usb_sg_request io;
+		u8 hdr[3];
+		u8 flush = SEND_IMMEDIATE;
+		int nents = 2;
+		size_t sg_len;
+
+		hdr[0] = priv->txrx_cmd;
+		hdr[1] = (stride - 1) & 0xff;
+		hdr[2] = ((stride - 1) >> 8) & 0xff;
+
+		sg_init_table(sg, ARRAY_SIZE(sg));
+		sg_set_buf(&sg[0], hdr, sizeof(hdr));
+		sg_set_buf(&sg[1], tx_src, stride);
+
+		if (priv->flush_per_block || last) {
+			sg_set_buf(&sg[2], &flush, sizeof(flush));
+			nents = 3;
+		}
+
+		sg_len = sizeof(hdr) + stride + (nents == 3 ? sizeof(flush) : 0);
+
+		ret = usb_sg_init(&io, udev,
+				 usb_sndbulkpipe(udev, priv_intf->bulk_out),
+				 0, sg, nents, sg_len,
+				 GFP_KERNEL);
+		used = true;
+		if (ret) {
+			fallback = true;
+			goto copy_path;
+		}
+
+		usb_sg_wait(&io);
+		ret = io.status;
+		if (ret == -EPIPE || ret == -EAGAIN) {
+			fallback = true;
+			goto copy_path;
+		}
+		if (ret) {
+			if (chunk_timeout && ret == -ETIMEDOUT)
+				*chunk_timeout = true;
+			return ret;
+		}
+		goto success;
+	}
+
+copy_path:
+
+	priv->xfer_buf[0] = priv->txrx_cmd;
+	priv->xfer_buf[1] = (stride - 1) & 0xff;
+	priv->xfer_buf[2] = ((stride - 1) >> 8) & 0xff;
+	memcpy(&priv->xfer_buf[3], tx_src, stride);
+	send_len = stride + 3;
+	if (priv->flush_per_block || last)
+		priv->xfer_buf[send_len++] = SEND_IMMEDIATE;
+
+	print_hex_dump_debug("WR: ", DUMP_PREFIX_OFFSET, 16, 1,
+			     priv->xfer_buf, send_len, 1);
+
+	ret = ftdi_spi_push_buf(priv, priv->xfer_buf, send_len);
+	if (ret < 0) {
+		if (chunk_timeout && ret == -ETIMEDOUT)
+			*chunk_timeout = true;
+		return ret;
+	}
+
+success:
+	if (copyfree_used)
+		*copyfree_used = used;
+	if (copyfree_fallback)
+		*copyfree_fallback = fallback;
+	return 0;
+}
+
+static int ftdi_spi_tx_rx_legacy(struct ftdi_spi *priv, struct spi_device *spi,
 			  struct spi_transfer *t)
 {
 	const struct ft232h_intf_ops *ops = priv->iops;
@@ -211,65 +1081,97 @@ static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
 	void *rx_offs;
 	const void *tx_offs;
 	size_t remaining, stride;
-        size_t rx_remaining;
-	size_t rx_stride;
-	int ret, tout = 10;
+	size_t rx_remaining;
+	int ret;
+	unsigned int polls;
+	/* Capture how often we had to poll the USB FIFO when batching. */
+	unsigned int empty_loops = 0;
+	unsigned int timeouts = 0;
+	bool loop_enabled = false;
 	const u8 *tx_data = t->tx_buf;
 	u8 *rx_data = t->rx_buf;
+	bool copyfree_enabled;
+
+	if (!priv_intf)
+		return -ENODEV;
 
 	ops->lock(priv->intf);
 
 	if (spi->mode & SPI_LOOP) {
 		ret = ftdi_spi_loopback_cfg(priv, 1);
 		if (ret < 0)
-			goto err;
+			goto out;
+		loop_enabled = true;
 	}
 
 	remaining = t->len;
 	rx_offs = rx_data;
 	tx_offs = tx_data;
+	copyfree_enabled = !priv->copyfree_disabled &&
+		(!t->bits_per_word || t->bits_per_word == 8) &&
+		priv->max_burst_bytes >= SZ_4K;
 
 	while (remaining) {
-		stride = min_t(size_t, remaining, SZ_512 - 3);
+		bool last;
+		bool copyfree_used = false;
+		bool copyfree_fallback = false;
+		bool chunk_timeout = false;
 
-		priv->xfer_buf[0] = priv->txrx_cmd;
-		priv->xfer_buf[1] = stride - 1;
-		priv->xfer_buf[2] = (stride - 1) >> 8;
-		memcpy(&priv->xfer_buf[3], tx_offs, stride);
-		priv->xfer_buf[3 + stride] = SEND_IMMEDIATE;
-		print_hex_dump_debug("WR: ", DUMP_PREFIX_OFFSET, 16, 1,
-				     priv->xfer_buf, stride + 3, 1);
+		stride = min_t(size_t, remaining, priv->max_burst_bytes);
+		stride = min_t(size_t, stride, sizeof(priv->xfer_buf) - 4);
+		if (!stride) {
+			ret = -EINVAL;
+			goto out;
+		}
 
-		ret = ops->write_data(priv->intf, priv->xfer_buf, stride + 4);
+		last = (stride == remaining);
+
+		ret = ftdi_spi_txrx_send_chunk(priv, priv_intf, tx_offs, stride,
+					 last, copyfree_enabled,
+					 &copyfree_used, &copyfree_fallback,
+					 &chunk_timeout);
 		if (ret < 0) {
 			dev_err(dev, "%s: xfer failed %d\n", __func__, ret);
-			goto fail;
+			goto out;
 		}
+
+		if (copyfree_used)
+			ftdi_spi_stats_copy_free(priv, stride, !copyfree_fallback);
+		ftdi_spi_stats_tx_chunk(priv, stride, copyfree_fallback,
+				 chunk_timeout);
+		if (copyfree_fallback)
+			copyfree_enabled = false;
+
 		dev_dbg(dev, "%s: WR %zu byte(s), TXRX CMD 0x%02x\n",
 			__func__, stride, priv->txrx_cmd);
 
-		rx_stride = min_t(size_t, stride, SZ_512);
-
-		tout = 10;
 		rx_remaining = stride;
+		polls = priv->rx_max_loops;
 		do {
-			rx_stride = min_t(size_t, rx_remaining, priv_intf->bulk_in_sz);
+			size_t rx_stride = min_t(size_t, rx_remaining,
+						priv_intf->bulk_in_sz);
 			ret = ops->read_data(priv->intf, rx_offs, rx_stride);
-			
 			if (ret < 0)
-				goto fail;
+				goto out;
 			if (!ret) {
-				if (--tout) {
+				empty_loops++;
+				if (--polls) {
+					if (priv->rx_retry_delay_us)
+						usleep_range(priv->rx_retry_delay_us,
+							     priv->rx_retry_delay_us + 50);
 					continue;
 				}
+				timeouts++;
 				dev_err(dev, "Read timeout\n");
 				ret = -ETIMEDOUT;
-				goto fail;
+				goto out;
 			}
+
 			print_hex_dump_debug("RD: ", DUMP_PREFIX_OFFSET, 16, 1,
-				     priv->xfer_buf, ret, 1);
+				     rx_offs, ret, 1);
 			rx_offs += ret;
 			rx_remaining -= ret;
+			polls = priv->rx_max_loops;
 		} while (rx_remaining);
 
 		remaining -= stride;
@@ -279,13 +1181,138 @@ static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
 
 	ret = 0;
 
-fail:
-	if (spi->mode & SPI_LOOP)
+out:
+	if (loop_enabled)
 		ftdi_spi_loopback_cfg(priv, 0);
-
-err:
 	ops->unlock(priv->intf);
+	ftdi_spi_stats_account_rx(priv, empty_loops, timeouts);
 	return ret;
+}
+
+static int ftdi_spi_tx_rx_pipeline(struct ftdi_spi *priv, struct spi_device *spi,
+				    struct spi_transfer *t)
+{
+	const struct ft232h_intf_ops *ops = priv->iops;
+	struct ft232h_intf_priv *priv_intf = usb_get_intfdata(priv->intf);
+	struct device *dev = &priv->pdev->dev;
+	const u8 *tx_offs = t->tx_buf;
+	u8 *rx_offs = t->rx_buf;
+	size_t remaining;
+	int ret = 0;
+	bool loop_enabled = false;
+	bool copyfree_enabled;
+
+	if (!priv_intf)
+		return -ENODEV;
+
+	ftdi_pipeline_reset(&priv->pipeline);
+
+	ops->lock(priv->intf);
+
+	if (spi->mode & SPI_LOOP) {
+		ret = ftdi_spi_loopback_cfg(priv, 1);
+		if (ret < 0)
+			goto out;
+		loop_enabled = true;
+	}
+
+	remaining = t->len;
+	copyfree_enabled = !priv->copyfree_disabled &&
+		(!t->bits_per_word || t->bits_per_word == 8) &&
+		priv->max_burst_bytes >= SZ_4K;
+
+	while (remaining) {
+		size_t stride = min_t(size_t, remaining, priv->max_burst_bytes);
+		bool last;
+		bool copyfree_used = false;
+		bool copyfree_fallback = false;
+		bool chunk_timeout = false;
+
+		stride = min_t(size_t, stride, sizeof(priv->xfer_buf) - 4);
+		if (priv_intf->bulk_in_sz > 2)
+			stride = min_t(size_t, stride, priv_intf->bulk_in_sz - 2);
+		if (!stride) {
+			ret = -EINVAL;
+			goto out;
+		}
+
+		while (priv->pipeline.in_flight >= priv->pipeline.depth) {
+			ret = ftdi_pipeline_wait_one(priv, priv_intf);
+			if (ret)
+				goto out;
+		}
+
+		ret = ftdi_pipeline_submit_read(priv, priv_intf, rx_offs, stride);
+		if (ret)
+			goto out;
+
+		last = (stride == remaining);
+
+		ret = ftdi_spi_txrx_send_chunk(priv, priv_intf, tx_offs, stride,
+					 last, copyfree_enabled,
+					 &copyfree_used, &copyfree_fallback,
+					 &chunk_timeout);
+		if (ret < 0) {
+			dev_err(dev, "%s: xfer failed %d\n", __func__, ret);
+			goto out;
+		}
+
+		if (copyfree_used)
+			ftdi_spi_stats_copy_free(priv, stride, !copyfree_fallback);
+		ftdi_spi_stats_tx_chunk(priv, stride, copyfree_fallback,
+				 chunk_timeout);
+		if (copyfree_fallback)
+			copyfree_enabled = false;
+
+		tx_offs += stride;
+		rx_offs += stride;
+		remaining -= stride;
+	}
+
+	ret = ftdi_pipeline_wait_all(priv, priv_intf);
+
+out:
+	if (loop_enabled)
+		ftdi_spi_loopback_cfg(priv, 0);
+	ops->unlock(priv->intf);
+
+	if (ret)
+		ftdi_pipeline_abort(priv, priv_intf);
+	else
+		ftdi_pipeline_reset(&priv->pipeline);
+
+	ftdi_spi_stats_account_rx(priv, 0, ret == -ETIMEDOUT ? 1 : 0);
+	return ret;
+}
+
+static int ftdi_spi_tx_rx(struct ftdi_spi *priv, struct spi_device *spi,
+			  struct spi_transfer *t)
+{
+	struct ft232h_intf_priv *priv_intf = usb_get_intfdata(priv->intf);
+	bool use_pipeline = false;
+
+	if (priv->pipeline.depth > 1 && priv->pipeline.ctxs && priv_intf) {
+		size_t maxp = priv_intf->bulk_in_pkt_sz;
+
+		if (!maxp && priv_intf->udev)
+			maxp = usb_maxpacket(priv_intf->udev,
+					 usb_rcvbulkpipe(priv_intf->udev,
+					 priv_intf->bulk_in));
+		if (!maxp)
+			maxp = SZ_512;
+
+		/*
+		 * Pipeline depth only helps on sizeable transfers.  Smaller control
+		 * messages complete more reliably through the legacy synchronous path.
+		 */
+		if (t->len >= max_t(size_t, maxp * 2, SZ_1K))
+			use_pipeline = true;
+	}
+
+	if (use_pipeline)
+		return ftdi_spi_tx_rx_pipeline(priv, spi, t);
+
+	return ftdi_spi_tx_rx_legacy(priv, spi, t);
 }
 
 static int ftdi_spi_push_buf(struct ftdi_spi *priv, const void *buf, size_t len)
@@ -310,6 +1337,22 @@ static int ftdi_spi_tx(struct ftdi_spi *priv, struct spi_transfer *xfer)
 	const void *tx_offs;
 	size_t remaining, stride;
 	int ret;
+	bool copy_free = false;
+	bool last;
+	const size_t hdr_len = 3;
+	struct ft232h_intf_priv *priv_intf = usb_get_intfdata(priv->intf);
+	struct usb_device *udev;
+
+	if (!priv_intf)
+		return -ENODEV;
+
+	udev = priv_intf->udev;
+
+	/* Copy-free path only handles 8-bit words with large payloads. */
+	if (!priv->copyfree_disabled &&
+	    (!xfer->bits_per_word || xfer->bits_per_word == 8) &&
+	    priv->max_burst_bytes >= SZ_4K)
+		copy_free = true;
 
 	priv->iops->lock(priv->intf);
 
@@ -317,20 +1360,86 @@ static int ftdi_spi_tx(struct ftdi_spi *priv, struct spi_transfer *xfer)
 	remaining = xfer->len;
 
 	do {
-		stride = min_t(size_t, remaining, sizeof(priv->xfer_buf) - 3);
+		bool copy_free_used = false;
+		bool copy_free_fallback = false;
+		/* Respect both FTDI command limits and caller supplied burst size. */
+		stride = min_t(size_t, remaining, priv->max_burst_bytes);
+		stride = min_t(size_t, stride, sizeof(priv->xfer_buf) - 3);
+		if (!stride) {
+			ret = -EINVAL;
+			goto err;
+		}
+		last = (stride == remaining);
 
 		priv->xfer_buf[0] = priv->tx_cmd;
 		priv->xfer_buf[1] = stride - 1;
 		priv->xfer_buf[2] = (stride - 1) >> 8;
 
-		memcpy(&priv->xfer_buf[3], tx_offs, stride);
+		if (copy_free && stride >= SZ_1K) {
+			struct scatterlist sg[3];
+			struct usb_sg_request io;
+			u8 hdr[3];
+			u8 flush = SEND_IMMEDIATE;
+			int nents = 2;
+			size_t sg_len;
 
-		ret = ftdi_spi_push_buf(priv, priv->xfer_buf, stride + 3);
-		if (ret < 0) {
-			dev_dbg(&priv->pdev->dev, "%s: tx failed %d\n",
-				__func__, ret);
-			goto err;
+			copy_free_used = true;
+
+			hdr[0] = priv->xfer_buf[0];
+			hdr[1] = priv->xfer_buf[1];
+			hdr[2] = priv->xfer_buf[2];
+
+			sg_init_table(sg, ARRAY_SIZE(sg));
+			sg_set_buf(&sg[0], hdr, hdr_len);
+			sg_set_buf(&sg[1], tx_offs, stride);
+
+			if (priv->flush_per_block || last) {
+				sg_set_buf(&sg[2], &flush, 1);
+				nents = 3;
+			}
+
+			sg_len = hdr_len + stride + (nents == 3 ? 1 : 0);
+
+			ret = usb_sg_init(&io, udev,
+					 usb_sndbulkpipe(udev, priv_intf->bulk_out),
+					 0, sg, nents, sg_len,
+					 GFP_KERNEL);
+			if (ret) {
+				copy_free = false;
+				copy_free_fallback = true;
+				goto copy_path;
+			}
+
+			usb_sg_wait(&io);
+			/* usb_sg_wait() drains and frees the request on completion. */
+		ret = io.status;
+		if (ret == -EPIPE || ret == -EAGAIN) {
+			/*
+			 * The host may NAK a long burst; fall back to the
+			 * memcpy path for this and subsequent chunks.
+			 */
+			copy_free = false;
+			copy_free_fallback = true;
+			goto copy_path;
 		}
+		if (ret)
+			goto err;
+		} else {
+copy_path:
+			memcpy(&priv->xfer_buf[3], tx_offs, stride);
+
+			ret = ftdi_spi_push_buf(priv, priv->xfer_buf, stride + 3);
+			if (ret < 0) {
+				dev_dbg(&priv->pdev->dev, "%s: tx failed %d\n",
+					__func__, ret);
+				goto err;
+			}
+		}
+
+		if (copy_free_used)
+			ftdi_spi_stats_copy_free(priv, stride, !copy_free_fallback);
+		ftdi_spi_stats_tx_chunk(priv, stride, copy_free_fallback,
+				ret == -ETIMEDOUT);
 		dev_dbg(&priv->pdev->dev, "%s: %zu byte(s) done\n",
 			__func__, stride);
 		remaining -= stride;
@@ -347,54 +1456,94 @@ static int ftdi_spi_rx(struct ftdi_spi *priv, struct spi_transfer *xfer)
 {
 	const struct ft232h_intf_ops *ops = priv->iops;
 	struct device *dev = &priv->pdev->dev;
-	size_t remaining, stride;
-	int ret, tout = 10;
+	struct ft232h_intf_priv *priv_intf = usb_get_intfdata(priv->intf);
+	size_t remaining;
+	size_t rx_remaining;
+	int ret;
 	void *rx_offs;
+	unsigned int polls;
+	/* Keep per-transfer poll statistics for debugfs counters. */
+	unsigned int empty_loops = 0;
+	unsigned int timeouts = 0;
 
 	dev_dbg(dev, "%s: CMD 0x%02x, len %u\n",
 		__func__, priv->rx_cmd, xfer->len);
 
-	priv->xfer_buf[0] = priv->rx_cmd;
-	priv->xfer_buf[1] = xfer->len - 1;
-	priv->xfer_buf[2] = (xfer->len - 1) >> 8;
-	priv->xfer_buf[3] = SEND_IMMEDIATE;
-	ops->lock(priv->intf);
+	if (!priv_intf)
+		return -ENODEV;
 
-	ret = ops->write_data(priv->intf, priv->xfer_buf, 4);
-	if (ret < 0)
-		goto err;
+	ops->lock(priv->intf);
 
 	remaining = xfer->len;
 	rx_offs = xfer->rx_buf;
 
-	do {
-		stride = min_t(size_t, remaining, SZ_512);
+	while (remaining) {
+		/* RX path shares the same burst sizing constraints as TX. */
+		size_t stride = min_t(size_t, remaining, priv->max_burst_bytes);
+		size_t cmd_len = 3;
+		bool last;
 
-		ret = ops->read_data(priv->intf, priv->xfer_buf, stride);
-		if (ret < 0)
-			goto err;
-
-		if (!ret) {
-			dev_dbg(dev, "Waiting for data (read: %02X), tout %d\n",
-				ret, tout);
-			if (--tout)
-				continue;
-
-			dev_dbg(dev, "read timeout...\n");
-			ret = -ETIMEDOUT;
-			goto err;
+		stride = min_t(size_t, stride, sizeof(priv->xfer_buf) - 4);
+		if (!stride) {
+			ret = -EINVAL;
+			goto out;
 		}
 
-		memcpy(rx_offs, priv->xfer_buf, ret);
+		last = (stride == remaining);
 
-		dev_dbg(dev, "%s: %d byte(s)\n", __func__, ret);
-		rx_offs += ret;
-		remaining -= ret;
-	} while (remaining);
+		priv->xfer_buf[0] = priv->rx_cmd;
+		priv->xfer_buf[1] = (stride - 1) & 0xff;
+		priv->xfer_buf[2] = ((stride - 1) >> 8) & 0xff;
+		if (priv->flush_per_block || last)
+			priv->xfer_buf[cmd_len++] = SEND_IMMEDIATE;
+
+		print_hex_dump_debug("WR-RX: ", DUMP_PREFIX_OFFSET, 16, 1,
+				     priv->xfer_buf, cmd_len, 1);
+
+		ret = ops->write_data(priv->intf, priv->xfer_buf, cmd_len);
+		if (ret < 0)
+			goto out;
+
+		rx_remaining = stride;
+		polls = priv->rx_max_loops;
+
+		do {
+			size_t rx_stride = min_t(size_t, rx_remaining,
+						priv_intf->bulk_in_sz);
+			ret = ops->read_data(priv->intf, rx_offs, rx_stride);
+			if (ret < 0)
+				goto out;
+
+			if (!ret) {
+				empty_loops++;
+				if (--polls) {
+					if (priv->rx_retry_delay_us)
+						usleep_range(priv->rx_retry_delay_us,
+							     priv->rx_retry_delay_us + 50);
+					continue;
+				}
+				timeouts++;
+				dev_dbg(dev, "read timeout...\n");
+				ret = -ETIMEDOUT;
+				goto out;
+			}
+
+			print_hex_dump_debug("RD: ", DUMP_PREFIX_OFFSET, 16, 1,
+				     rx_offs, ret, 1);
+			rx_offs += ret;
+			rx_remaining -= ret;
+			polls = priv->rx_max_loops;
+		} while (rx_remaining);
+
+		remaining -= stride;
+		dev_dbg(dev, "%s: chunk %zu done, remaining %zu\n",
+			__func__, stride, remaining);
+	}
 
 	ret = 0;
-err:
+out:
 	ops->unlock(priv->intf);
+	ftdi_spi_stats_account_rx(priv, empty_loops, timeouts);
 	return ret;
 }
 
@@ -405,6 +1554,7 @@ static int ftdi_spi_transfer_one(struct spi_controller *ctlr,
 	struct ftdi_spi *priv = spi_controller_get_devdata(ctlr);
 	struct device *dev = &priv->pdev->dev;
 	int ret = 0;
+	ktime_t start = 0;
 
 	if (!xfer->len)
 		return 0;
@@ -474,6 +1624,10 @@ static int ftdi_spi_transfer_one(struct spi_controller *ctlr,
 	dev_dbg(dev, "%s: mode 0x%x, CMD RX/TX 0x%x/0x%x\n",
 		__func__, spi->mode, priv->rx_cmd, priv->tx_cmd);
 
+	if (priv->stats_enabled)
+		/* Timestamps are only captured when debug stats are in use. */
+		start = ktime_get();
+
 	if (xfer->tx_buf && xfer->rx_buf)
 		ret = ftdi_spi_tx_rx(priv, spi, xfer);
 	else if (xfer->tx_buf)
@@ -482,6 +1636,13 @@ static int ftdi_spi_transfer_one(struct spi_controller *ctlr,
 		ret = ftdi_spi_rx(priv, xfer);
 
 	dev_dbg(dev, "%s: xfer ret %d\n", __func__, ret);
+
+	if (priv->stats_enabled) {
+		u64 duration = ktime_to_ns(ktime_sub(ktime_get(), start));
+		ftdi_spi_stats_complete(priv, xfer, ret, duration);
+	}
+
+	ftdi_spi_maybe_retune(priv);
 
 	spi_finalize_current_transfer(ctlr);
 	return ret;
@@ -562,7 +1723,11 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 	    !pd->ops->gpio_direction_output)
 		return -EINVAL;
 
-	master = spi_alloc_master(&pdev->dev, sizeof(*priv));
+#if defined(SPI_DEVICE_CS_CNT_MAX)
+		master = spi_alloc_host(&pdev->dev, sizeof(*priv));
+#else
+		master = spi_alloc_master(&pdev->dev, sizeof(*priv));
+#endif
 	if (!master)
 		return -ENOMEM;
 
@@ -573,6 +1738,141 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 	priv->pdev = pdev;
 	priv->intf = to_usb_interface(dev->parent);
 	priv->iops = pd->ops;
+
+	{
+		struct ft232h_intf_priv *intf_priv = usb_get_intfdata(priv->intf);
+		size_t burst_limit = sizeof(priv->xfer_buf) - 4;
+		size_t burst = min_t(size_t, SZ_512 - 3, burst_limit);
+
+		if (param_perf_profile == PERF_PROFILE_BALANCED)
+			burst = max_t(size_t, burst, SZ_4K);
+		else if (param_perf_profile == PERF_PROFILE_AGGRESSIVE)
+			burst = max_t(size_t, burst, SZ_32K);
+
+		if (param_max_block)
+			burst = param_max_block;
+
+		burst = clamp_t(size_t, burst, 1, burst_limit);
+		priv->max_burst_bytes = burst;
+	priv->flush_per_block = param_flush_per_block;
+	if (!param_flush_overridden) {
+		switch (param_perf_profile) {
+		case PERF_PROFILE_LEGACY:
+		case PERF_PROFILE_BALANCED:
+			priv->flush_per_block = true;
+			break;
+		case PERF_PROFILE_AGGRESSIVE:
+		default:
+			priv->flush_per_block = false;
+			break;
+		}
+	}
+		priv->rx_retry_delay_us = param_rx_retry_us;
+		if (priv->rx_retry_delay_us) {
+			unsigned int loops;
+
+			/* Target roughly 2.5ms of total wait before timing out. */
+			loops = (2500 + priv->rx_retry_delay_us - 1) /
+				priv->rx_retry_delay_us;
+			loops = clamp_t(unsigned int, loops, 2, 1000);
+			priv->rx_max_loops = loops;
+		} else {
+			priv->rx_max_loops = 10;
+		}
+
+		if (intf_priv && intf_priv->bulk_in_pkt_sz) {
+			/* Align bursts to whole USB packets when possible. */
+			size_t max_align = intf_priv->bulk_in_pkt_sz;
+			if (max_align && priv->max_burst_bytes > max_align) {
+				size_t aligned = priv->max_burst_bytes -
+					(priv->max_burst_bytes % max_align);
+				if (!aligned)
+					aligned = max_align;
+				priv->max_burst_bytes = min_t(size_t, aligned,
+							      burst_limit);
+			}
+		}
+
+		dev_dbg(dev, "SPI burst=%zu flush=%d rx_retry_us=%u loops=%u\n",
+			priv->max_burst_bytes, priv->flush_per_block,
+			priv->rx_retry_delay_us, priv->rx_max_loops);
+	}
+
+	{
+		unsigned int depth = param_pipeline_depth;
+
+		if (!param_pipeline_overridden || !depth) {
+			/* Auto-tune pipeline depth when the user leaves it unspecified. */
+			switch (param_perf_profile) {
+			case PERF_PROFILE_LEGACY:
+				depth = 1;
+				break;
+			case PERF_PROFILE_BALANCED:
+			depth = min_t(unsigned int, 2U, FTDI_PIPELINE_MAX);
+				break;
+			case PERF_PROFILE_AGGRESSIVE:
+			default:
+				depth = FTDI_PIPELINE_MAX;
+				break;
+			}
+		}
+
+	/* Configure the RX pipeliner; aggressive profile starts at max depth. */
+	ret = ftdi_spi_pipeline_setup(priv, depth);
+	}
+	if (ret) {
+		dev_warn(dev, "Failed to enable URB pipeline (%d), falling back to synchronous mode\n",
+			 ret);
+	}
+
+	/* Metrics are on by default; users can still opt out via module param. */
+	priv->stats_enabled = param_enable_stats;
+	spin_lock_init(&priv->stats_lock);
+	memset(&priv->stats, 0, sizeof(priv->stats));
+	priv->tuning_jiffies = jiffies;
+	priv->tuning_rounds = 0;
+	priv->flush_forced = param_flush_overridden;
+	priv->pipeline_forced = param_pipeline_overridden ? priv->pipeline.depth : 0;
+	priv->copyfree_disabled = param_flush_overridden && param_flush_per_block;
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	if (priv->stats_enabled) {
+		const char *dbg_name = dev_name(&master->dev);
+		char *alloc_name = NULL;
+		if (!ftdi_debugfs_root)
+			ftdi_debugfs_root = debugfs_create_dir("ftdi_spi", NULL);
+		if (IS_ERR(ftdi_debugfs_root)) {
+			dev_warn(dev, "debugfs root unavailable: %ld\n",
+				 PTR_ERR(ftdi_debugfs_root));
+			ftdi_debugfs_root = NULL;
+		} else {
+			if (!dbg_name || !dbg_name[0]) {
+				alloc_name = devm_kasprintf(dev, GFP_KERNEL, "%s.%d",
+						  SPI_INTF_DEVNAME, priv->pdev->id);
+				if (!alloc_name) {
+					dev_warn(dev, "debugfs name alloc failed\n");
+					goto debugfs_done;
+				}
+				dbg_name = alloc_name;
+			}
+
+			priv->debugfs_root = debugfs_create_dir(dbg_name,
+							ftdi_debugfs_root);
+			if (IS_ERR(priv->debugfs_root)) {
+				dev_warn(dev, "debugfs dir creation failed: %ld\n",
+					 PTR_ERR(priv->debugfs_root));
+				priv->debugfs_root = NULL;
+			} else {
+				debugfs_create_file("stats", 0444, priv->debugfs_root,
+						priv, &ftdi_stats_fops);
+				debugfs_create_file("stats_reset", 0200,
+						priv->debugfs_root, priv,
+						&ftdi_stats_reset_fops);
+			}
+		debugfs_done:
+		}
+	}
+#endif
 
 	master->bus_num = (param_bus_num >= 0) ? param_bus_num : -1;
 	master->mode_bits = SPI_CPOL | SPI_CPHA | SPI_LOOP |
@@ -625,6 +1925,7 @@ static int ftdi_spi_probe(struct platform_device *pdev)
 	return 0;
 err:
 	platform_set_drvdata(pdev, NULL);
+	ftdi_spi_pipeline_teardown(priv);
 	spi_unregister_controller(master);
 	return ret;
 }
@@ -640,7 +1941,7 @@ static void ftdi_mpsse_irq_remove(struct usb_interface *intf)
 	struct ft232h_intf_priv *priv = usb_get_intfdata(intf);
 	struct gpio_chip *chip = &priv->mpsse_gpio;
 	
-	if (priv->irq_base)
+	if (priv->irq_base >= 0)
 		irq_free_descs(priv->irq_base, chip->ngpio);
 }
 
@@ -661,6 +1962,13 @@ static int ftdi_spi_remove(struct platform_device *pdev)
 	priv = spi_controller_get_devdata(master);
 
 	device_for_each_child(&master->dev, priv, ftdi_spi_slave_release);
+
+#if IS_ENABLED(CONFIG_DEBUG_FS)
+	if (priv->debugfs_root)
+		debugfs_remove_recursive(priv->debugfs_root);
+#endif
+
+	ftdi_spi_pipeline_teardown(priv);
 
 	spi_unregister_controller(master);
 	return 0;
@@ -875,8 +2183,12 @@ static int ftdi_read_data(struct usb_interface *intf, void *buf, size_t len)
 		return 0;
 
 	/* Remove 2-byte status from each 512-byte packet */
-	size_t maxp = usb_maxpacket(priv->udev, usb_rcvbulkpipe(priv->udev, priv->bulk_in));
-	if (!maxp) maxp = 512;
+	size_t maxp = priv->bulk_in_pkt_sz;
+	if (!maxp)
+		maxp = usb_maxpacket(priv->udev,
+				 usb_rcvbulkpipe(priv->udev, priv->bulk_in));
+	if (!maxp)
+		maxp = SZ_512;
 	size_t offset = 0;
 	size_t out_len = 0;
 	while (offset < desc.act_len) {
@@ -1351,6 +2663,7 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv)
 		return -ENOMEM;
+	priv->irq_base = -1;
 
 	iface_desc = intf->cur_altsetting;
 
@@ -1362,7 +2675,7 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 
 		if (usb_endpoint_is_bulk_in(endpoint)) {
 			priv->bulk_in = endpoint->bEndpointAddress;
-			priv->bulk_in_sz = usb_endpoint_maxp(endpoint);
+			priv->bulk_in_pkt_sz = usb_endpoint_maxp(endpoint);
 		}
 	}
 
@@ -1382,9 +2695,33 @@ static int ft232h_intf_probe(struct usb_interface *intf,
 	mutex_init(&priv->ops_mutex);
 	usb_set_intfdata(intf, priv);
 
+	if (!priv->bulk_in_pkt_sz) {
+		dev_err(dev, "Missing bulk-in endpoint\n");
+		return -ENODEV;
+	}
+
+	priv->bulk_in_sz = priv->bulk_in_pkt_sz;
+
+	if (param_perf_profile == PERF_PROFILE_BALANCED)
+		priv->bulk_in_sz = max_t(size_t, priv->bulk_in_sz, SZ_4K);
+	else if (param_perf_profile == PERF_PROFILE_AGGRESSIVE)
+		priv->bulk_in_sz = max_t(size_t, priv->bulk_in_sz, SZ_32K);
+
+	if (param_bulk_in_buf_kb)
+		priv->bulk_in_sz = max_t(size_t, priv->bulk_in_sz,
+				       param_bulk_in_buf_kb * SZ_1K);
+
+	/* Keep buffers packet-aligned while allowing large HS bursts (<=64 KiB). */
+	priv->bulk_in_sz = clamp_t(size_t, priv->bulk_in_sz,
+				     priv->bulk_in_pkt_sz, (size_t)SZ_64K);
+	priv->bulk_in_sz = roundup(priv->bulk_in_sz, priv->bulk_in_pkt_sz);
+
 	priv->bulk_in_buf = devm_kmalloc(dev, priv->bulk_in_sz, GFP_KERNEL);
 	if (!priv->bulk_in_buf)
 		return -ENOMEM;
+
+	dev_dbg(dev, "bulk-in cfg: pkt=%zu buf=%zu\n",
+		priv->bulk_in_pkt_sz, priv->bulk_in_sz);
 
 	priv->udev = usb_get_dev(interface_to_usbdev(intf));
 
@@ -1710,8 +3047,8 @@ static int ftdi_mpsse_irq_probe(struct usb_interface *intf)
 	irqc->irq_set_type = mpsse_irq_set_type;
 
 	priv->irq_base = irq_alloc_descs(-1, 0, chip->ngpio, 0);
-	if (!priv->irq_base)
-		return -ENOMEM;
+	if (priv->irq_base < 0)
+		return priv->irq_base;
 	
 	for (i = 0; i < chip->ngpio; i++) {
 		priv->irq_enabled[i] = false;
